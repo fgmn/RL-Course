@@ -1,0 +1,122 @@
+### 前言
+
+项目地址：https://github.com/leggedrobotics/rsl_rl
+
+项目简介：快速简单的强化学习算法实现，设计为完全在 GPU 上运行。这段代码是 NVIDIA Isaac GYM 提供的 rl-pytorch 的进化版。
+
+
+
+下载源码，查看目录，整个项目模块化得非常好，每个部分各司其职。下面我们自底向上地进行讲解加粗的部分。
+
+rsl\_rl/
+│  \_\_init\_\_.py
+│
+├─algorithms/
+│  │  \_\_init\_\_.py
+│  │  **ppo.py  # PPO算法的实现**
+│  │
+├─env/
+│  │  \_\_init\_\_.py
+│  │  vec\_env.py  # 实现并行处理多个环境的向量化环境
+│  │
+├─modules/
+│  │  \_\_init\_\_.py
+│  │  **actor\_critic.py  # 定义 Actor-Critic 网络结构**
+│  │  actor\_critic\_recurrent.py  # 定义包含循环层的 Actor-Critic 网络
+│  │  normalizer.py  # 数据正规化工具，有助于训练过程的稳定性
+│  │
+├─runners/
+│  │  \_\_init\_\_.py
+│  │  **on\_policy\_runner.py  # 实现用于执行 on-policy 算法训练循环的运行器**
+│  │
+├─storage/
+│  │  \_\_init\_\_.py
+│  │  **rollout\_storage.py  # 存储和管理策略 rollout 数据的工具**
+│  │
+└─utils/
+   │  \_\_init\_\_.py
+   │  neptune\_utils.py  # 用于与 Neptune.ai 集成的工具
+   │  utils.py  # 通用实用工具函数
+   │  wandb\_utils.py  # 用于与 Weights & Biases 集成的工具
+
+
+
+### rollout 数据储存和管理（rollout\_storage.py）
+
+定义了一个名为 `RolloutStorage` 的类，用于存储和管理在强化学习训练过程中从环境中收集到的数据（称为rollouts）。
+
+- 定义`Transition` 类
+
+用于存储单个时间步的所有相关数据，包括观察值、动作、奖励、完成标志（dones）、值函数估计、动作的对数概率、动作的均值和标准差，以及可能的隐藏状态（对于使用循环网络的情况）。
+
+- 特权观察值（Privileged Observations）
+
+除了`self.observations`外还有`self.privileged_observations`的使用，在强化学习中是指那些在训练期间可用但在实际部署或测试时不可用的额外信息。这些信息通常提供了环境的内部状态或其他有助于学习的提示，但在现实世界应用中可能难以获得或完全不可用。在训练期间使用特权观察值的一种常见方法是通过**教师-学生架构**（我们常常也称作特权学习），其中一个拥有全部信息的教师模型（可以访问特权观察值）来指导一个学生模型（只能访问普通观察值）。学生模型的目标是模仿教师模型的决策，尽管它没有直接访问特权信息。
+
+- 奖励和优势的计算
+
+```python
+    def compute_returns(self, last_values, gamma, lam):
+        advantage = 0
+        for step in reversed(range(self.num_transitions_per_env)):
+            if step == self.num_transitions_per_env - 1:
+                next_values = last_values
+            else:
+                next_values = self.values[step + 1]
+            next_is_not_terminal = 1.0 - self.dones[step].float()
+            delta = self.rewards[step] + next_is_not_terminal * gamma * next_values - self.values[step]
+            advantage = delta + next_is_not_terminal * gamma * lam * advantage
+            self.returns[step] = advantage + self.values[step]
+
+        # Compute and normalize the advantages
+        self.advantages = self.returns - self.values
+        self.advantages = (self.advantages - self.advantages.mean()) / (self.advantages.std() + 1e-8)
+```
+
+这段代码实现的是在强化学习中计算回报（returns）和优势（advantages）的逻辑，具体是使用了一种称为广义优势估算（Generalized Advantage Estimation, GAE）的方法。GAE是一种权衡偏差和方差以及平滑回报信号的技术，由以下几个数学公式定义：
+
+1. **TD残差（Temporal Difference Residual）**:
+   $\delta_t = R_t + \gamma V(S_{t+1}) (1 - done_t) - V(S_t)$
+   其中，$\delta_t$是时刻$t$的TD残差，$R_t$是奖励，$\gamma$是折扣因子，$V(S_t)$是状态$S_t$的价值函数估计，$done_t$是表示当前状态是否为终止状态的指示函数（如果当前状态为终止状态，则$done_t = 1$；否则，$done_t = 0$）。如果$done_t = 1$，那么$\gamma V(S_{t+1})$项将为 0，因为终止状态之后没有未来回报。
+
+2. **GAE优势估计**:
+   $A_t^{GAE(\gamma, \lambda)} = \sum_{l=0}^{\infty} (\gamma \lambda)^l \delta_{t+l}$
+   在代码中，这个无限求和是通过迭代地计算来近似的，具体的迭代公式为：
+   $A_t = \delta_t + (\gamma \lambda) A_{t+1} (1 - done_t)$
+   其中，$A_t$是时刻$t$的优势估计，$\lambda$是用来平衡TD估计和蒙特卡罗估计之间权重的参数。
+
+3. **回报的计算**:
+   $G_t = A_t + V(S_t)$
+   其中，$G_t$是时刻$t$的回报估计。
+
+代码中使用的变量名与数学符号的对应关系：
+
+| 变量名            | 数学符号           | 含义                                                         |
+| ----------------- | ------------------ | ------------------------------------------------------------ |
+| `rewards[step]`   | $R_t$              | 时刻$t$的奖励                                                |
+| `gamma`           | $\gamma$           | 折扣因子，用于计算未来奖励的现值                             |
+| `values[step]`    | $V(S_t)$           | 状态$S_t$在当前策略下的价值函数估计                          |
+| `dones[step]`     | $done_t$           | 指示当前状态$S_t$是否为终止状态的标志（1 表示终止，0 表示非终止） |
+| `delta`           | $\delta_t$         | 时刻$t$的 TD 残差                                            |
+| `advantage`       | $A_t$              | 时刻$t$的优势估计，根据 GAE 方法计算                         |
+| `lam`             | $\lambda$          | 用于 GAE 计算中平衡 TD 估计和蒙特卡罗估计之间权重的参数      |
+| `returns[step]`   | $G_t$              | 时刻$t$的回报估计                                            |
+| `advantages`      | $A_t^{norm}$       | 标准化后的优势估计                                           |
+| `mu_A`, `sigma_A` | $\mu_A$,$\sigma_A$ | 优势估计的平均值和标准差                                     |
+| `epsilon`         | $\epsilon$         | 避免除零错误而加的小常数，通常取值为 `1e-8`                  |
+
+代码中的循环从最后一个转换开始向前迭代，使用以上的数学公式来计算每一步的优势和回报。最后，它还对优势进行了标准化处理，即从每个优势中减去所有优势的平均值，并除以标准差，以减少训练期间的方差并加速收敛。标准化公式如下：
+$A_t^{norm} = \frac{A_t - \mu_A}{\sigma_A + \epsilon}$
+其中，$\mu_A$是优势的平均值，$\sigma_A$是优势的标准差，$\epsilon$​ 是为了防止除以零而加的一个小常数（在代码中为 `1e-8`）。
+
+- 轨迹的平均长度
+
+类中并没有显式存储轨迹的长度，轨迹长度隐含在`self.dones`之中。代码中使用的方法是：将每个环境中最后一步置为‘1’，然后flatten（展开）、拼接所有环境中的`dones`得到`flat_dones`，差分数组中为‘1’位置的索引得到智能体在每个环境中的步数，即轨迹长度。这个统计量有助于了解训练过程中智能体的表现。
+
+- mini-batch迭代器
+
+ `mini_batch_generator` 函数通过在多个训练周期（`num_epochs`）内，从经验回放缓冲区中随机选择小批量数据（包括观察值 `observations`、动作 `actions`、奖励 `rewards` 等）来生成小批量数据集。该函数利用 `torch.randperm` 生成随机索引 `indices` 来随机化数据抽样，进而支持基于批处理的学习方法，如梯度下降。通过每次只处理必要的数据量，该生成器在优化模型参数的同时，也优化了内存使用，确保了训练过程的高效性和灵活性。
+
+
+
+（未完待续）
